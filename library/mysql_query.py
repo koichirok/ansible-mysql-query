@@ -98,12 +98,14 @@ def change_required(cursor, table, identifiers, desired_values):
     :type identifiers: dict
     :param desired_values: a list of tuples (column name, values) that the record should match
     :type desired_values: dict
-    :return: one of INSERT_REQUIRED, UPDATE_REQUIRED or NO_ACTION_REQUIRED
-    :rtype: int
+    :return: one of INSERT_REQUIRED, UPDATE_REQUIRED or NO_ACTION_REQUIRED with diff
+    :rtype: (int, dict)
     """
+    diff = {}
+    columns = desired_values.keys()
     query = "select %(columns)s from %(table)s where %(values)s" % dict(
         table=table,
-        columns=", ".join(desired_values.keys()),
+        columns=", ".join(columns),
         values=" AND ".join(map(lambda x: "%s='%s'" % x, identifiers.items())),
     )
 
@@ -112,21 +114,24 @@ def change_required(cursor, table, identifiers, desired_values):
     except MySQLdb.ProgrammingError as e:
         (errcode, message) = e.args
         if errcode == 1146:
-            return ERR_NO_SUCH_TABLE
+            return (ERR_NO_SUCH_TABLE, diff)
         else:
             raise e
 
-    if res == 0:
-        return INSERT_REQUIRED
-
     # bring the values argument into shape to compare directly to fetchone() result
     expected_query_result = tuple(desired_values.values())
+    diff['after'] = ''.join(["%s: %s\n" % (k,v) for k,v in zip(columns,expected_query_result)])
+    if res == 0:
+        diff['before'] = ""
+        return (INSERT_REQUIRED, diff)
+
     actual_result = cursor.fetchone()
+    diff['before'] = ''.join(["%s: %s\n" % (k,v) for k,v in zip(columns,actual_result)])
     if expected_query_result == actual_result:
-        return NO_ACTION_REQUIRED
+        return (NO_ACTION_REQUIRED, diff)
 
     # a record has been found but does not match the desired values
-    return UPDATE_REQUIRED
+    return (UPDATE_REQUIRED, diff)
 
 
 def execute_action(cursor, action, table, identifier, values, defaults):
@@ -278,11 +283,13 @@ def main():
 
     with closing(connect(build_connection_parameter(module.params), module)) as db_connection:
         # find out what needs to be done (independently of check-mode)
-        required_action = change_required(db_connection.cursor(), table, identifiers, values)
+        required_action, diff = change_required(db_connection.cursor(), table, identifiers, values)
 
         # if we're in check mode, there's no action required, or we already failed: directly set the exit_message
         if module.check_mode or required_action == NO_ACTION_REQUIRED or failed(required_action):
             exit_message = exit_messages[required_action]
+            if module._diff:
+                exit_message['diff'] = diff
         else:
             # otherwise, execute the required action to get the exit message
             exit_message = execute_action(db_connection.cursor(), required_action, table, identifiers, values, defaults)

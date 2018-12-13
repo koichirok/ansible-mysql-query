@@ -29,6 +29,10 @@ options:
     required: false
     description:
         - dictionary of additional values that will be used iff an insert is required.
+  charset:
+    required: false
+    description:
+        - character set used by the connection.
 """
 
 EXAMPLES = """
@@ -343,7 +347,8 @@ def build_connection_parameter(params):
         ('name', 'db'),
         ('login_host', 'host'),
         ('login_port', 'port'),
-        ('login_unix_socket', 'unix_socket')
+        ('login_unix_socket', 'unix_socket'),
+        ('charset', 'charset')
     ]
 
     t = [(mysql_name, params[ansible_name])
@@ -385,6 +390,7 @@ def main():
             login_host=dict(default="localhost"),
             login_port=dict(default=3306, type='int'),
             login_unix_socket=dict(default=None),
+            charset=dict(default=None),
             name=dict(required=True, aliases=['db']),
             state=dict(default="present", choices=['absent', 'present']),
 

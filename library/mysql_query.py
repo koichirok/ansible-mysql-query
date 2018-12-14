@@ -160,40 +160,17 @@ def check_row_exists(cursor, table, identifiers):
     return exists == 1
 
 
-def change_required(state, cursor, table, identifiers, desired_values):
+def get_affected_row(cursor, table, identifiers, desired_values):
     """
-    check if a change is required
-    :param state: state, either 'present' or 'absent'
+    Get rows that matches identifiers.
     :param cursor: cursor object able to execute queries
     :param table: name of the table to look into
-    :type table: str
-    :param identifiers: a list of tuples (column name, value) to use in where clause
-    :type identifiers: dict
-    :param desired_values: a list of tuples (column name, values) that the record should match
-    :type desired_values: dict
-    :return: one of DELETE_REQUIRED, INSERT_REQUIRED, UPDATE_REQUIRED or NO_ACTION_REQUIRED
-    :rtype: int
+    :param identifiers:
+    :return: matched rows
     """
-
-    # first, let's determine if we do a simple existence-check, or if we also have to compare values
-    if state == "absent" or not desired_values:
-        row_exists = check_row_exists(cursor, table, identifiers)
-
-        if state == "absent" and row_exists:
-            return DELETE_REQUIRED
-
-        if state == "present" and not row_exists:
-            return INSERT_REQUIRED
-
-        # other cases:  state == "absent" and not row_exists:
-        #               state == "present" and row_exists
-        # both require no action
-        return NO_ACTION_REQUIRED
-
-    # ok, we have to compare values, so let's make a query selecting all the columns with desired_values
     query = "select {columns} from {table} where {values}".format(
         table=table,
-        columns=", ".join(desired_values.keys()),
+        columns=", ".join(desired_values.keys()) if desired_values else "*",
         values=" AND ".join(generate_where_segment(identifiers.items())),
     )
 
@@ -206,22 +183,83 @@ def change_required(state, cursor, table, identifiers, desired_values):
         else:
             raise e
 
+    return cursor.fetchone()
+
+
+def make_diff(row, desired_values):
+    """
+    make ansible module diff
+    :param rows: rows 
+    """
+
+    keys = desired_values.keys() if desired_values else row.keys
+    if row is None:
+        row = {}
+
+    linefmt = "{0}: {1!s}"
+    #linefmt = "{0:>"+str(len(max(keys,key=len)))+"}: {1!s}"
+    diff = {
+        "before": "\n".join([linefmt.format(key, row[key]) for key in sorted(keys) if key in row]),
+        "after": "\n".join([linefmt.format(key, desired_values[key]) for key in sorted(keys)])
+    }
+    if row:
+        diff["before"] = "\n".join([linefmt.format(key, row[key]) for key in sorted(keys) if key in row]),
+    else:
+        diff["before"] = ""
+
+    return diff
+
+
+def change_required(module, cursor, table, identifiers, desired_values):
+    """
+    check if a change is required
+    :param state: state, either 'present' or 'absent'
+    :param cursor: cursor object able to execute queries
+    :param table: name of the table to look into
+    :type table: str
+    :param identifiers: a list of tuples (column name, value) to use in where clause
+    :type identifiers: dict
+    :param desired_values: a list of tuples (column name, values) that the record should match
+    :type desired_values: dict
+    :return: one of DELETE_REQUIRED, INSERT_REQUIRED, UPDATE_REQUIRED or NO_ACTION_REQUIRED and diff
+    :rtype: (int, dict)
+    """
+
+    state = module.params['state']
+    row = get_affected_row(cursor, table, identifiers)
+    diff = make_diff(row, desired_values) if module._diff else {}
+
+    # first, let's determine if we do a simple existence-check, or if we also have to compare values
+    if state == "absent" or not desired_values:
+        if state == "absent" and row:
+            return (DELETE_REQUIRED, diff)
+
+        if state == "present" and not row:
+            return (INSERT_REQUIRED, diff)
+
+        # other cases:  state == "absent" and not row_exists:
+        #               state == "present" and row_exists
+        # both require no action
+        return (NO_ACTION_REQUIRED, {})
+
+    # ok, we have to compare values, so let's make a query selecting all the columns with desired_values
+
     # if no row has been found at all, an insert is required
-    if res == 0:
-        return INSERT_REQUIRED
+    if not row:
+        return (INSERT_REQUIRED, diff)
 
     # a row has been found, so we need to compare the returned values:
 
     # bring the values argument into shape to compare directly to fetchone() result
     expected_query_result = tuple(desired_values.values())
-    actual_result = cursor.fetchone()
+    actual_result = tuple(row[key] for key in desired_values.keys())
 
     # compare expected_query_result to actual_result with implicit casting
-    if tuples_weak_equals(expected_query_result, actual_result):
-        return NO_ACTION_REQUIRED
+    if not tuples_weak_equals(expected_query_result, actual_result):
+        return (NO_ACTION_REQUIRED, {})
 
     # a record has been found but does not match the desired values
-    return UPDATE_REQUIRED
+    return (UPDATE_REQUIRED, diff)
 
 
 def execute_action(cursor, action, table, identifier, values, defaults):
@@ -275,7 +313,7 @@ def insert_record(cursor, table, identifiers, values, defaults):
 
 def delete_record(cursor, table, identifiers):
     where = ' AND '.join(['{0} = %s'.format(column) for column in identifiers.keys()])
-    query = "DELETE FROM {0} WHERE {1}".format(table, where)
+    query = "DELETE FROM {0} WHERE {1} LIMIT 1".format(table, where)
     cursor.execute(query, tuple(identifiers.values()))
     return dict(changed=True, msg='Successfully deleted one row')
 
@@ -372,11 +410,12 @@ def main():
 
     with closing(connect(build_connection_parameter(module.params), module)) as db_connection:
         # find out what needs to be done (independently of check-mode)
-        required_action = change_required(module.params['state'], db_connection.cursor(), table, identifiers, values)
+        required_action, diff = change_required(module.params['state'], db_connection.cursor(MySQLdb.cursors.DictCursor), table, identifiers, values)
 
         # if we're in check mode, there's no action required, or we already failed: directly set the exit_message
         if module.check_mode or required_action == NO_ACTION_REQUIRED or failed(required_action):
             exit_message = exit_messages[required_action]
+            exit_message["diff"] = diff
         else:
             # otherwise, execute the required action to get the exit message
             exit_message = execute_action(db_connection.cursor(), required_action, table, identifiers, values, defaults)

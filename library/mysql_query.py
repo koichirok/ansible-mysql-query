@@ -160,6 +160,53 @@ def check_row_exists(cursor, table, identifiers):
     return exists == 1
 
 
+def create_diff(cursor, action, table, identifiers, values, defaults):
+    """
+    create ansible module diff
+    :param action:
+    :param cursor:
+    :param table:
+    :param identifiers:
+    :param values:
+    :param defaults:
+    :return: dictionay that contains diff information
+    :rtype: dict
+    """
+    if action in [NO_ACTION_REQUIRED, ERR_NO_SUCH_TABLE]:
+        return {}
+
+    # make 'before' info
+    if action != INSERT_REQUIRED:
+        if action == DELETE_REQUIRED:
+            columns = ', '.join(values.keys()),
+        else:
+            columns = '*'
+
+        query = "select {columns} from {table} where {values}".format(
+            table=table,
+            columns=columns,
+            values=" AND ".join(generate_where_segment(identifiers.items())),
+        )
+        cursor.execute(query)
+        before = dict(extract_column_value_maps(cursor.fetchone()))
+    else:
+        before = {}
+
+    # make 'after' info
+    after = before.copy()
+    if action != DELETE_REQUIRED:
+        after.update(values)
+    if action == INSERT_REQUIRED:
+        after.update(defaults)
+
+    linefmt = "{0}: {1!s}\n"
+
+    return dict(
+        before=''.join([linefmt.format(k, before[k]) for k in sorted(before.keys())]),
+        after=''.join([linefmt.format(k, after[k]) for k in sorted(after.keys())])
+    )
+
+
 def change_required(state, cursor, table, identifiers, desired_values):
     """
     check if a change is required
@@ -275,7 +322,7 @@ def insert_record(cursor, table, identifiers, values, defaults):
 
 def delete_record(cursor, table, identifiers):
     where = ' AND '.join(['{0} = %s'.format(column) for column in identifiers.keys()])
-    query = "DELETE FROM {0} WHERE {1}".format(table, where)
+    query = "DELETE FROM {0} WHERE {1} LIMIT 1".format(table, where)
     cursor.execute(query, tuple(identifiers.values()))
     return dict(changed=True, msg='Successfully deleted one row')
 
@@ -377,6 +424,8 @@ def main():
         # if we're in check mode, there's no action required, or we already failed: directly set the exit_message
         if module.check_mode or required_action == NO_ACTION_REQUIRED or failed(required_action):
             exit_message = exit_messages[required_action]
+            if module.check_mode and module._diff:
+                exit_message["diff"] = create_diff(db_connection.cursor(mysql_driver.cursors.DictCursor), required_action, table, identifiers, values, defaults)
         else:
             # otherwise, execute the required action to get the exit message
             exit_message = execute_action(db_connection.cursor(), required_action, table, identifiers, values, defaults)
